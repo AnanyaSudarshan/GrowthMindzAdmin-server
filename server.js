@@ -14,6 +14,29 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-producti
 app.use(cors());
 app.use(express.json());
 
+// Ensure single admins table supports roles (Admin/Staff)
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admins (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        role VARCHAR(20) NOT NULL DEFAULT 'Admin',
+        phone VARCHAR(20),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    // Ensure required columns exist on older databases
+    await pool.query("ALTER TABLE admins ADD COLUMN IF NOT EXISTS name VARCHAR(255)");
+    await pool.query("ALTER TABLE admins ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'Admin'");
+    await pool.query("ALTER TABLE admins ADD COLUMN IF NOT EXISTS phone VARCHAR(20)");
+  } catch (e) {
+    // Ignore startup migration errors
+  }
+})();
+
 // Middleware to verify JWT token
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -36,7 +59,7 @@ const authenticateToken = (req, res, next) => {
 
 // Admin/Staff Login
 app.post('/api/admin/login', async (req, res) => {
-  const { email, password, role } = req.body;
+  const { email, password, role, name } = req.body;
 
   try {
     // Validate input
@@ -44,13 +67,13 @@ app.post('/api/admin/login', async (req, res) => {
       return res.status(400).json({ error: 'All fields are required' });
     }
 
-    // Check if admin/staff exists
-    let result;
-    if (role === 'Admin') {
-      result = await pool.query('SELECT * FROM "Admin" WHERE email = $1', [email]);
-    } else {
-      result = await pool.query('SELECT * FROM staff WHERE email = $1', [email]);
-    }
+  // Normalize
+    const isAdmin = role === 'Admin';
+    const normalizedEmail = email.trim();
+
+    // Check if user exists (single admins table with role)
+    const selectQuery = 'SELECT * FROM admins WHERE LOWER(email) = LOWER($1) AND role = $2';
+    const result = await pool.query(selectQuery, [normalizedEmail, isAdmin ? 'Admin' : 'Staff']);
 
     if (result.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid email or password' });
@@ -58,11 +81,10 @@ app.post('/api/admin/login', async (req, res) => {
 
     const user = result.rows[0];
 
-    // Verify password
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      return res.status(401).json({ error: 'Invalid email or password' });
-    }
+    // Verify password using plaintext comparison (per requirement)
+    const stored = user.password || '';
+    const validPassword = stored === password;
+    if (!validPassword) return res.status(401).json({ error: 'Invalid email or password' });
 
     // Generate JWT token
     const token = jwt.sign(
@@ -94,7 +116,7 @@ app.get('/api/admin/dashboard/stats', authenticateToken, async (req, res) => {
   try {
     const usersCount = await pool.query('SELECT COUNT(*) FROM users');
     const coursesCount = await pool.query('SELECT COUNT(*) FROM courses');
-    const staffCount = await pool.query('SELECT COUNT(*) FROM staff');
+    const staffCount = await pool.query("SELECT COUNT(*) FROM admins WHERE role = 'Staff'");
 
     res.json({
       users: parseInt(usersCount.rows[0].count),
@@ -115,9 +137,9 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
     const result = await pool.query(`
       SELECT 
         u.id,
-        u.firstname || ' ' || u.lastname as name,
+        COALESCE(u.first_name || ' ' || u.last_name, u.firstname || ' ' || u.lastname, 'Unknown') as name,
         u.email,
-        c.name as course,
+        COALESCE(c.name, 'No Course') as course,
         COALESCE(
           (SELECT ROUND(AVG(progress)) 
            FROM user_progress 
@@ -132,7 +154,7 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
     res.json(result.rows);
   } catch (error) {
     console.error('Get users error:', error);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Server error', details: error.message });
   }
 });
 
@@ -232,10 +254,10 @@ app.post('/api/admin/courses/:id/quizzes', authenticateToken, async (req, res) =
 
 // ==================== STAFF ROUTES ====================
 
-// Get all staff
+// Get all staff (from admins with role='Staff')
 app.get('/api/admin/staff', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, name, email, phone FROM staff ORDER BY id');
+    const result = await pool.query("SELECT id, name, email, phone FROM admins WHERE role = 'Staff' ORDER BY id");
     res.json(result.rows);
   } catch (error) {
     console.error('Get staff error:', error);
@@ -243,17 +265,14 @@ app.get('/api/admin/staff', authenticateToken, async (req, res) => {
   }
 });
 
-// Add staff
+// Add staff (insert into admins with role='Staff')
 app.post('/api/admin/staff', authenticateToken, async (req, res) => {
   const { name, email, password, phone } = req.body;
 
   try {
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-
     const result = await pool.query(
-      'INSERT INTO staff (name, email, password, phone) VALUES ($1, $2, $3, $4) RETURNING id, name, email, phone',
-      [name, email, hashedPassword, phone]
+      "INSERT INTO admins (name, email, password, phone, role) VALUES ($1, $2, $3, $4, 'Staff') RETURNING id, name, email, phone",
+      [name, email, password, phone]
     );
 
     res.json({ message: 'Staff added successfully', staff: result.rows[0] });
@@ -266,7 +285,7 @@ app.post('/api/admin/staff', authenticateToken, async (req, res) => {
   }
 });
 
-// Update staff
+// Update staff (in admins where role='Staff')
 app.put('/api/admin/staff/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { name, email, password, phone } = req.body;
@@ -277,10 +296,10 @@ app.put('/api/admin/staff/:id', authenticateToken, async (req, res) => {
 
     if (password) {
       const hashedPassword = await bcrypt.hash(password, 10);
-      query = 'UPDATE staff SET name = $1, email = $2, password = $3, phone = $4 WHERE id = $5 RETURNING id, name, email, phone';
+      query = "UPDATE admins SET name = $1, email = $2, password = $3, phone = $4 WHERE id = $5 AND role = 'Staff' RETURNING id, name, email, phone";
       values = [name, email, hashedPassword, phone, id];
     } else {
-      query = 'UPDATE staff SET name = $1, email = $2, phone = $3 WHERE id = $4 RETURNING id, name, email, phone';
+      query = "UPDATE admins SET name = $1, email = $2, phone = $3 WHERE id = $4 AND role = 'Staff' RETURNING id, name, email, phone";
       values = [name, email, phone, id];
     }
 
@@ -300,7 +319,7 @@ app.put('/api/admin/staff/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete staff
+// Delete staff (from admins where role='Staff')
 app.delete('/api/admin/staff', authenticateToken, async (req, res) => {
   const { ids } = req.body; // Array of staff IDs to delete
 
@@ -310,7 +329,7 @@ app.delete('/api/admin/staff', authenticateToken, async (req, res) => {
     }
 
     const placeholders = ids.map((_, index) => `$${index + 1}`).join(',');
-    const query = `DELETE FROM staff WHERE id IN (${placeholders})`;
+    const query = `DELETE FROM admins WHERE role = 'Staff' AND id IN (${placeholders})`;
     
     await pool.query(query, ids);
     res.json({ message: 'Staff deleted successfully' });

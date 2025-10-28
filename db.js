@@ -4,7 +4,7 @@ const pool = new Pool({
   user: 'postgres',
   host: 'localhost',
   database: 'grw_db',
-  password: 'root',
+  password: 'grw26@',
   port: 5432,
 });
 
@@ -13,7 +13,7 @@ pool.connect((err, client, release) => {
   if (err) {
     return console.error('Error connecting to database:', err.message);
   } else {
-    console.log('Connected to PostgreSQL database');
+    console.log('✅ Admin Server connected to PostgreSQL database');
     release();
   }
 });
