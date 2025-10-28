@@ -32,6 +32,12 @@ app.use(express.json());
     await pool.query("ALTER TABLE admins ADD COLUMN IF NOT EXISTS name VARCHAR(255)");
     await pool.query("ALTER TABLE admins ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'Admin'");
     await pool.query("ALTER TABLE admins ADD COLUMN IF NOT EXISTS phone VARCHAR(20)");
+    // Ensure phone column is VARCHAR for large phone numbers (migrate from integer if needed)
+    try {
+      await pool.query("ALTER TABLE admins ALTER COLUMN phone TYPE VARCHAR(20) USING phone::varchar(20)");
+    } catch (e) {
+      // ignore if already correct type
+    }
   } catch (e) {
     // Ignore startup migration errors
   }
@@ -105,6 +111,167 @@ app.post('/api/admin/login', async (req, res) => {
     });
   } catch (error) {
     console.error('Login error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ==================== PROFILE ROUTES ====================
+
+// Get current admin profile (sanitized)
+app.get('/api/admin/profile', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.user || {};
+    if (!id) return res.status(401).json({ error: 'Unauthorized' });
+
+    const result = await pool.query(
+      'SELECT id, name, email, phone, role FROM admins WHERE id = $1',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Profile not found' });
+    }
+
+    const user = result.rows[0];
+    // Do not return password. Provide empty strings for password fields for UI convenience
+    res.json({
+      name: user.name || '',
+      email: user.email || '',
+      phone: user.phone || '',
+      role: user.role || 'Admin',
+      password: '',
+      confirm_password: ''
+    });
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Update current admin profile (with optional password change)
+app.put('/api/admin/profile', authenticateToken, async (req, res) => {
+  try {
+    const { id, role: tokenRole } = req.user || {};
+    if (!id) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { name, email, phone, role, password, confirm_password } = req.body || {};
+
+    if (!name || !email) {
+      return res.status(400).json({ error: 'Name and email are required' });
+    }
+
+    // Enforce role safety: allow changing role explicitly only if caller is Admin
+    const canChangeRole = (tokenRole === 'Admin');
+
+    // Validate password if present
+    let values;
+    let query;
+    if (password || confirm_password) {
+      if (!password || !confirm_password) {
+        return res.status(400).json({ error: 'Both password and confirm_password are required' });
+      }
+      if (password !== confirm_password) {
+        return res.status(400).json({ error: 'Passwords do not match' });
+      }
+      if (password.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      }
+      // Store password as provided (no hashing per request)
+      if (canChangeRole && role) {
+        query = 'UPDATE admins SET name = $1, email = $2, phone = $3, role = $4, password = $5 WHERE id = $6 RETURNING id, name, email, phone, role';
+        values = [name, email, phone, role, password, id];
+      } else {
+        query = 'UPDATE admins SET name = $1, email = $2, phone = $3, password = $4 WHERE id = $5 RETURNING id, name, email, phone, role';
+        values = [name, email, phone, password, id];
+      }
+    } else {
+      if (canChangeRole && role) {
+        query = 'UPDATE admins SET name = $1, email = $2, phone = $3, role = $4 WHERE id = $5 RETURNING id, name, email, phone, role';
+        values = [name, email, phone, role, id];
+      } else {
+        query = 'UPDATE admins SET name = $1, email = $2, phone = $3 WHERE id = $4 RETURNING id, name, email, phone, role';
+        values = [name, email, phone, id];
+      }
+    }
+
+    // Ensure uniqueness on email
+    const existing = await pool.query('SELECT id FROM admins WHERE LOWER(email) = LOWER($1) AND id <> $2', [email, id]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'Email already in use' });
+    }
+
+    const result = await pool.query(query, values);
+    const updated = result.rows[0];
+    res.json({
+      message: 'Profile updated successfully',
+      profile: {
+        name: updated.name,
+        email: updated.email,
+        phone: updated.phone,
+        role: updated.role
+      }
+    });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Update profile by email param (PUT /api/admin/profile/:email)
+// Allows updating name, email, phone, role (if admin), and password (if provided)
+app.put('/api/admin/profile/:email', authenticateToken, async (req, res) => {
+  try {
+    const requester = req.user || {};
+    const emailParam = req.params.email;
+    const { name, email, phone, role, password, confirm_password } = req.body || {};
+
+    if (!emailParam) return res.status(400).json({ error: 'Email parameter required' });
+
+    // Find target user
+    const target = await pool.query('SELECT * FROM admins WHERE LOWER(email) = LOWER($1)', [emailParam]);
+    if (target.rows.length === 0) return res.status(404).json({ error: 'Profile not found' });
+    const user = target.rows[0];
+
+    if (!name || !email) return res.status(400).json({ error: 'Name and email are required' });
+
+    // Email uniqueness
+    const dup = await pool.query('SELECT id FROM admins WHERE LOWER(email) = LOWER($1) AND id <> $2', [email, user.id]);
+    if (dup.rows.length > 0) return res.status(400).json({ error: 'Email already in use' });
+
+    const canChangeRole = requester.role === 'Admin';
+
+    let query;
+    let values;
+
+    if (password || confirm_password) {
+      if (!password || !confirm_password) return res.status(400).json({ error: 'Both password and confirm_password are required' });
+      if (password !== confirm_password) return res.status(400).json({ error: 'Passwords do not match' });
+      if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      // Store password as provided (no hashing per request)
+      if (canChangeRole && role) {
+        query = 'UPDATE admins SET name = $1, email = $2, phone = $3, role = $4, password = $5 WHERE id = $6 RETURNING id, name, email, phone, role';
+        values = [name, email, phone, role, password, user.id];
+      } else {
+        query = 'UPDATE admins SET name = $1, email = $2, phone = $3, password = $4 WHERE id = $5 RETURNING id, name, email, phone, role';
+        values = [name, email, phone, password, user.id];
+      }
+    } else {
+      if (canChangeRole && role) {
+        query = 'UPDATE admins SET name = $1, email = $2, phone = $3, role = $4 WHERE id = $5 RETURNING id, name, email, phone, role';
+        values = [name, email, phone, role, user.id];
+      } else {
+        query = 'UPDATE admins SET name = $1, email = $2, phone = $3 WHERE id = $4 RETURNING id, name, email, phone, role';
+        values = [name, email, phone, user.id];
+      }
+    }
+
+    const updated = await pool.query(query, values);
+    res.json({
+      message: 'Profile updated successfully',
+      profile: updated.rows[0]
+    });
+  } catch (error) {
+    console.error('Update profile by email error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -295,9 +462,9 @@ app.put('/api/admin/staff/:id', authenticateToken, async (req, res) => {
     let values;
 
     if (password) {
-      const hashedPassword = await bcrypt.hash(password, 10);
+      // Store password as provided (no hashing per request)
       query = "UPDATE admins SET name = $1, email = $2, password = $3, phone = $4 WHERE id = $5 AND role = 'Staff' RETURNING id, name, email, phone";
-      values = [name, email, hashedPassword, phone, id];
+      values = [name, email, password, phone, id];
     } else {
       query = "UPDATE admins SET name = $1, email = $2, phone = $3 WHERE id = $4 AND role = 'Staff' RETURNING id, name, email, phone";
       values = [name, email, phone, id];
