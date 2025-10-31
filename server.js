@@ -377,94 +377,91 @@ app.get('/api/admin/dashboard/stats', authenticateToken, async (req, res) => {
 // Get all users
 app.get('/api/admin/users', authenticateToken, async (req, res) => {
   try {
-    let result;
+    // Preferred path: join enrollments to get courses_opted and progress using enrollments.uid = users.id
     try {
-      // Try with users.course_opted
-      result = await pool.query(`
-        SELECT 
+      const result = await pool.query(`
+        SELECT
           u.id,
           COALESCE(u.first_name, '') AS first_name,
           COALESCE(u.last_name, '') AS last_name,
           u.email,
-          COALESCE(u.course_opted::text, c.course_title, 'No Course') AS course_opted,
+          COALESCE(e.courses_opted::text, 'No Course') AS course_opted,
           COALESCE(
-            CASE WHEN (u.progress::text) ~ '^[0-9]+$' THEN u.progress::int ELSE NULL END,
-            (
-              SELECT ROUND(AVG(up.progress))
-              FROM user_progress up
-              WHERE up.user_id = u.id AND (up.course_id = c.id OR c.id IS NULL)
-            )::int,
+            CASE WHEN (e.progress::text) ~ '^[0-9]+$' THEN e.progress::int ELSE NULL END,
             0
           ) AS progress
         FROM users u
-        LEFT JOIN user_enrollments ue ON u.id = ue.user_id
-        LEFT JOIN courses c ON ue.course_id = c.id
+        LEFT JOIN enrollments e ON e.uid = u.id
         ORDER BY u.id
       `);
       return res.json(result.rows);
-    } catch (err1) {
-      if (err1 && err1.code === '42703') {
-        // Retry with users.courses_opted
-        try {
-          const alt = await pool.query(`
-            SELECT 
-              u.id,
-              COALESCE(u.first_name, '') AS first_name,
-              COALESCE(u.last_name, '') AS last_name,
-              u.email,
-              COALESCE(u.courses_opted::text, c.course_title, 'No Course') AS course_opted,
-              COALESCE(
-                CASE WHEN (u.progress::text) ~ '^[0-9]+$' THEN u.progress::int ELSE NULL END,
-                (
-                  SELECT ROUND(AVG(up.progress))
-                  FROM user_progress up
-                  WHERE up.user_id = u.id AND (up.course_id = c.id OR c.id IS NULL)
-                )::int,
-                0
-              ) AS progress
-            FROM users u
-            LEFT JOIN user_enrollments ue ON u.id = ue.user_id
-            LEFT JOIN courses c ON ue.course_id = c.id
-            ORDER BY u.id
-          `);
-          return res.json(alt.rows);
-        } catch (err2) {
-          if (err2 && err2.code === '42P01') {
-            // Fall through to simple users-only queries
-          } else {
-            throw err2;
-          }
-        }
-      } else if (err1 && err1.code !== '42P01') {
-        throw err1;
-      }
-
-      // If related tables don't exist, or we fell through due to 42P01, return simple users-only query
+    } catch (errEnroll) {
+      // Fallback to legacy logic if enrollments or its columns are not present
+      let result;
       try {
-        const simple = await pool.query(`
+        result = await pool.query(`
           SELECT 
-            id,
-            COALESCE(first_name, '') AS first_name,
-            COALESCE(last_name, '') AS last_name,
-            email,
-            COALESCE(course_opted::text, 'No Course') AS course_opted,
+            u.id,
+            COALESCE(u.first_name, '') AS first_name,
+            COALESCE(u.last_name, '') AS last_name,
+            u.email,
+            COALESCE(u.course_opted::text, c.course_title, 'No Course') AS course_opted,
             COALESCE(
-              CASE WHEN (progress::text) ~ '^[0-9]+$' THEN progress::int ELSE NULL END,
+              CASE WHEN (u.progress::text) ~ '^[0-9]+$' THEN u.progress::int ELSE NULL END,
+              (
+                SELECT ROUND(AVG(up.progress))
+                FROM user_progress up
+                WHERE up.user_id = u.id AND (up.course_id = c.id OR c.id IS NULL)
+              )::int,
               0
             ) AS progress
-          FROM users
-          ORDER BY id
+          FROM users u
+          LEFT JOIN user_enrollments ue ON u.id = ue.user_id
+          LEFT JOIN courses c ON ue.course_id = c.id
+          ORDER BY u.id
         `);
-        return res.json(simple.rows);
-      } catch (err3) {
-        if (err3 && err3.code === '42703') {
-          const simpleAlt = await pool.query(`
+        return res.json(result.rows);
+      } catch (err1) {
+        if (err1 && err1.code === '42703') {
+          try {
+            const alt = await pool.query(`
+              SELECT 
+                u.id,
+                COALESCE(u.first_name, '') AS first_name,
+                COALESCE(u.last_name, '') AS last_name,
+                u.email,
+                COALESCE(u.courses_opted::text, c.course_title, 'No Course') AS course_opted,
+                COALESCE(
+                  CASE WHEN (u.progress::text) ~ '^[0-9]+$' THEN u.progress::int ELSE NULL END,
+                  (
+                    SELECT ROUND(AVG(up.progress))
+                    FROM user_progress up
+                    WHERE up.user_id = u.id AND (up.course_id = c.id OR c.id IS NULL)
+                  )::int,
+                  0
+                ) AS progress
+              FROM users u
+              LEFT JOIN user_enrollments ue ON u.id = ue.user_id
+              LEFT JOIN courses c ON ue.course_id = c.id
+              ORDER BY u.id
+            `);
+            return res.json(alt.rows);
+          } catch (err2) {
+            if (err2 && err2.code !== '42P01') throw err2;
+          }
+        } else if (err1 && err1.code !== '42P01') {
+          throw err1;
+        }
+
+        // Simple users-only fallback
+        try {
+          const simple = await pool.query(`
             SELECT 
               id,
               COALESCE(first_name, '') AS first_name,
               COALESCE(last_name, '') AS last_name,
               email,
-              COALESCE(courses_opted::text, 'No Course') AS course_opted,
+              COALESCE(course_opted::text, 'No Course') AS course_opted,
               COALESCE(
                 CASE WHEN (progress::text) ~ '^[0-9]+$' THEN progress::int ELSE NULL END,
                 0
@@ -472,9 +469,27 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
             FROM users
             ORDER BY id
           `);
-          return res.json(simpleAlt.rows);
+          return res.json(simple.rows);
+        } catch (err3) {
+          if (err3 && err3.code === '42703') {
+            const simpleAlt = await pool.query(`
+              SELECT 
+                id,
+                COALESCE(first_name, '') AS first_name,
+                COALESCE(last_name, '') AS last_name,
+                email,
+                COALESCE(courses_opted::text, 'No Course') AS course_opted,
+                COALESCE(
+                  CASE WHEN (progress::text) ~ '^[0-9]+$' THEN progress::int ELSE NULL END,
+                  0
+                ) AS progress
+              FROM users
+              ORDER BY id
+            `);
+            return res.json(simpleAlt.rows);
+          }
+          throw err3;
         }
-        throw err3;
       }
     }
   } catch (error) {
