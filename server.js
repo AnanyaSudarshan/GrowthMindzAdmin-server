@@ -119,6 +119,37 @@ app.use(express.json());
   }
 })();
 
+// Ensure quizes (normalized) tables exist per required schema
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS quizes (
+        qid SERIAL PRIMARY KEY,
+        cid INTEGER REFERENCES courses(id) ON DELETE CASCADE,
+        quiz_title VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    // Ensure created_at column exists and has a default on legacy DBs
+    await pool.query("ALTER TABLE quizes ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
+    await pool.query("ALTER TABLE quizes ALTER COLUMN created_at SET DEFAULT CURRENT_TIMESTAMP");
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS quiz_content (
+        question_id SERIAL PRIMARY KEY,
+        qid INTEGER REFERENCES quizes(qid) ON DELETE CASCADE,
+        question TEXT NOT NULL,
+        option_a TEXT NOT NULL,
+        option_b TEXT NOT NULL,
+        option_c TEXT NOT NULL,
+        option_d TEXT NOT NULL,
+        correct_answer TEXT NOT NULL
+      );
+    `);
+  } catch (e) {
+    // ignore optional table creation
+  }
+})();
+
 // Middleware to verify JWT token
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -832,6 +863,183 @@ app.delete('/api/admin/staff', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Delete staff error:', error);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ==================== QUIZ MANAGEMENT (quizes / quiz_content) ====================
+
+// Add new quiz with one or multiple questions
+app.post('/api/quizzes', authenticateToken, async (req, res) => {
+  const { cid, quiz_title, question, option_a, option_b, option_c, option_d, correct_answer, questions } = req.body || {};
+
+  // Support either single question fields or an array 'questions'
+  const items = Array.isArray(questions) && questions.length > 0
+    ? questions
+    : (question ? [{ question, option_a, option_b, option_c, option_d, correct_answer }] : []);
+
+  if (!cid || !quiz_title || items.length === 0) {
+    return res.status(400).json({ error: 'cid, quiz_title and at least one question are required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const qz = await client.query(
+      'INSERT INTO quizes (cid, quiz_title, created_at) VALUES ($1, $2, NOW()) RETURNING qid, cid, quiz_title, created_at',
+      [cid, quiz_title]
+    );
+    const createdQuiz = qz.rows[0];
+
+    const insertedQuestions = [];
+    for (const it of items) {
+      const { question, option_a, option_b, option_c, option_d, correct_answer } = it || {};
+      if (!question || !option_a || !option_b || !option_c || !option_d || !correct_answer) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Each question requires question, option_a, option_b, option_c, option_d and correct_answer' });
+      }
+      const ins = await client.query(
+        'INSERT INTO quiz_content (qid, question, option_a, option_b, option_c, option_d, correct_answer) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+        [createdQuiz.qid, question, option_a, option_b, option_c, option_d, correct_answer]
+      );
+      insertedQuestions.push(ins.rows[0]);
+    }
+
+    await client.query('COMMIT');
+    return res.json({ message: 'Quiz created successfully', quiz: { ...createdQuiz, questions: insertedQuestions } });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('Create quiz error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Edit quiz and its questions
+app.put('/api/quizzes/:qid', authenticateToken, async (req, res) => {
+  const { qid } = req.params;
+  const { cid, quiz_title, questions, deleted_question_ids } = req.body || {};
+
+  if (!qid) return res.status(400).json({ error: 'qid is required' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (quiz_title || cid) {
+      const cols = [];
+      const vals = [];
+      let idx = 1;
+      if (quiz_title) { cols.push(`quiz_title = $${idx++}`); vals.push(quiz_title); }
+      if (cid) { cols.push(`cid = $${idx++}`); vals.push(cid); }
+      vals.push(qid);
+      const upd = await client.query(
+        `UPDATE quizes SET ${cols.join(', ')} WHERE qid = $${idx} RETURNING qid, cid, quiz_title, created_at`,
+        vals
+      );
+      if (upd.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Quiz not found' });
+      }
+    }
+
+    // Handle deletions
+    if (Array.isArray(deleted_question_ids) && deleted_question_ids.length > 0) {
+      const ph = deleted_question_ids.map((_, i) => `$${i + 1}`).join(',');
+      await client.query(`DELETE FROM quiz_content WHERE qid = $${deleted_question_ids.length + 1} AND question_id IN (${ph})`, [...deleted_question_ids, qid]);
+    }
+
+    // Handle upserts for questions
+    if (Array.isArray(questions)) {
+      for (const q of questions) {
+        const { question_id, question, option_a, option_b, option_c, option_d, correct_answer } = q || {};
+        if (question_id) {
+          // Update existing question
+          const cols = [];
+          const vals = [];
+          let i = 1;
+          if (question) { cols.push(`question = $${i++}`); vals.push(question); }
+          if (option_a) { cols.push(`option_a = $${i++}`); vals.push(option_a); }
+          if (option_b) { cols.push(`option_b = $${i++}`); vals.push(option_b); }
+          if (option_c) { cols.push(`option_c = $${i++}`); vals.push(option_c); }
+          if (option_d) { cols.push(`option_d = $${i++}`); vals.push(option_d); }
+          if (correct_answer) { cols.push(`correct_answer = $${i++}`); vals.push(correct_answer); }
+          if (cols.length > 0) {
+            vals.push(question_id, qid);
+            await client.query(`UPDATE quiz_content SET ${cols.join(', ')} WHERE question_id = $${i++} AND qid = $${i} `, vals);
+          }
+        } else {
+          // Insert new question
+          if (!question || !option_a || !option_b || !option_c || !option_d || !correct_answer) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'New questions require all fields' });
+          }
+          await client.query(
+            'INSERT INTO quiz_content (qid, question, option_a, option_b, option_c, option_d, correct_answer) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+            [qid, question, option_a, option_b, option_c, option_d, correct_answer]
+          );
+        }
+      }
+    }
+
+    await client.query('COMMIT');
+
+    // Return updated quiz with questions
+    const quizRes = await pool.query('SELECT qid, cid, quiz_title, created_at FROM quizes WHERE qid = $1', [qid]);
+    if (quizRes.rows.length === 0) return res.status(404).json({ error: 'Quiz not found' });
+    const qs = await pool.query('SELECT * FROM quiz_content WHERE qid = $1 ORDER BY question_id', [qid]);
+    return res.json({ message: 'Quiz updated successfully', quiz: { ...quizRes.rows[0], questions: qs.rows } });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('Update quiz error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Delete quiz and its related content
+app.delete('/api/quizzes/:qid', authenticateToken, async (req, res) => {
+  const { qid } = req.params;
+  if (!qid) return res.status(400).json({ error: 'qid is required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM quiz_content WHERE qid = $1', [qid]);
+    const del = await client.query('DELETE FROM quizes WHERE qid = $1', [qid]);
+    await client.query('COMMIT');
+    if (del.rowCount === 0) return res.status(404).json({ error: 'Quiz not found' });
+    return res.json({ message: 'Quiz deleted successfully' });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('Delete quiz error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Fetch all quizzes and questions for a course
+app.get('/api/quizzes/:cid', authenticateToken, async (req, res) => {
+  const { cid } = req.params;
+  if (!cid) return res.status(400).json({ error: 'cid is required' });
+  try {
+    const quizzes = await pool.query('SELECT qid, cid, quiz_title, created_at FROM quizes WHERE cid = $1 ORDER BY qid', [cid]);
+    const qids = quizzes.rows.map(r => r.qid);
+    let content = [];
+    if (qids.length > 0) {
+      const placeholders = qids.map((_, i) => `$${i + 1}`).join(',');
+      const result = await pool.query(`SELECT * FROM quiz_content WHERE qid IN (${placeholders}) ORDER BY question_id`, qids);
+      content = result.rows;
+    }
+    const grouped = quizzes.rows.map(q => ({
+      ...q,
+      questions: content.filter(c => c.qid === q.qid)
+    }));
+    return res.json(grouped);
+  } catch (error) {
+    console.error('Fetch quizzes error:', error);
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
