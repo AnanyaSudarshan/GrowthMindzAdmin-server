@@ -90,13 +90,13 @@ const completeSetup = async () => {
     if (existingAdmin.rows.length > 0) {
       console.log('  ℹ Admin account already exists');
     } else {
-      // Create admin account
-      const hashedPassword = await bcrypt.hash('admin@1234', 10);
+      // Create admin account (storing plaintext password as per server requirement)
+      const plainPassword = 'admin@1234';
       
-      await pool.query(
-        'INSERT INTO admins (name, email, password, phone) VALUES ($1, $2, $3, $4)',
-        ['Admin User', 'admin@growthmindz.com', hashedPassword, '+1 234-567-8900']
-      );
+    await pool.query(
+      'INSERT INTO admins (name, email, password, phone, role) VALUES ($1, $2, $3, $4, $5)',
+      ['Admin User', 'admin@growthmindz.com', plainPassword, '+1 234-567-8900', 'Admin']
+    );
       console.log('  ✓ Admin account created');
       console.log('     Email: admin@growthmindz.com');
       console.log('     Password: admin@1234');
